@@ -1,0 +1,1372 @@
+<!DOCTYPE html>
+<!-- saved from url=(0012)about:srcdoc -->
+<html lang="pt-BR"><head><meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+    <script>
+      (function() {
+        // Capture host references before any artifact code runs: Window.parent
+        // is [Replaceable] (a top-level `var parent` in artifact code would
+        // replace the accessor with a data property), and a top-level
+        // `const crypto` would shadow the global — either would otherwise
+        // silently break the bridge for artifacts that worked before.
+        const realParent = window.parent;
+        const cryptoObj = window.crypto;
+        const RealURL = URL;
+        const realDecodeURIComponent = decodeURIComponent;
+        const RealTextEncoder = TextEncoder;
+        const realAtob = atob;
+        // html-to-image is only used by takeScreenshot: fetched on first use, not as a
+        // parser-blocking tag. Native fetch, captured before the proxy override below.
+        const realFetch = typeof window.fetch === 'function' ? window.fetch.bind(window) : null;
+        const HTML_TO_IMAGE_SRC = "https://cdnjs.cloudflare.com/ajax/libs/html-to-image/1.11.13/html-to-image.min.js";
+        const HTML_TO_IMAGE_INTEGRITY = "sha512-iZ2ORl595Wx6miw+GuadDet4WQbdSWS3JLMoNfY8cRGoEFy6oT3G9IbcrBeL6AfkgpA51ETt/faX6yLV+/gFJg==";
+        let htmlToImageLoad = null;
+        const loadHtmlToImage = () => {
+          if (!htmlToImageLoad) {
+            htmlToImageLoad = (realFetch
+              ? realFetch(HTML_TO_IMAGE_SRC, { integrity: HTML_TO_IMAGE_INTEGRITY, credentials: 'omit', referrerPolicy: 'no-referrer' })
+              : Promise.reject(new Error('fetch unavailable'))
+            )
+              .then((res) => {
+                if (!res.ok) throw new Error('html-to-image failed to load (' + res.status + ')');
+                return res.text();
+              })
+              .then((source) => {
+                // UMD bundle: hide the artifact's AMD/CommonJS globals so it takes the
+                // window-global branch; inline script text runs synchronously on insert.
+                const hidden = ['define', 'module', 'exports'].map((k) => {
+                  const entry = { k, own: Object.prototype.hasOwnProperty.call(window, k), v: window[k] };
+                  try { window[k] = undefined; } catch (e) {}
+                  return entry;
+                });
+                try {
+                  const el = document.createElement('script');
+                  el.text = source;
+                  (document.head || document.documentElement).appendChild(el);
+                } finally {
+                  hidden.forEach(({ k, own, v }) => {
+                    try { if (own) { window[k] = v; } else { delete window[k]; } } catch (e) {}
+                  });
+                }
+                if (!window.htmlToImage) throw new Error('html-to-image unavailable after load');
+                return window.htmlToImage;
+              });
+            // A failed load may be transient; let the next screenshot retry.
+            htmlToImageLoad.catch(() => { htmlToImageLoad = null; });
+          }
+          return htmlToImageLoad;
+        };
+        // crypto.randomUUID exists only in Secure Contexts; fall back to a
+        // unique non-crypto id elsewhere (http://LAN-IP dev flows) —
+        // uniqueness is what the bridge needs, unpredictability is
+        // defense-in-depth on top of the source guards.
+        const newRequestId =
+          cryptoObj && typeof cryptoObj.randomUUID === "function"
+            ? function () { return cryptoObj.randomUUID(); }
+            : function () { return Date.now() + "-" + Math.random(); };
+
+        // Bridge request ids are crypto-random (not sequential) so they
+        // cannot be predicted by other frames in the tab.
+        let callbacksMap = new Map();
+        let streamControllers = new Map();
+        
+        window.claude = {
+          complete: (prompt) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'claudeComplete', id, prompt }, '*');
+            });
+          }
+        };
+
+        // storage.get and .list calls not yet answered, read by the parent at this frame's 'load' (an answer may restyle the page); counted
+        // here, not there, because WebKit can run this frame's 'load' in the parent before a message posted while parsing has arrived.
+        let storageReadsOut = 0;
+        try { Object.defineProperty(window, '__storageReadsOut', { configurable: true, get: () => storageReadsOut }); } catch (e) {}
+        window.storage = {
+          get: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageGet', id, key, shared }, '*');
+              storageReadsOut += 1;
+            });
+          },
+          set: (key, value, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageSet', id, key, value, shared }, '*');
+            });
+          },
+          delete: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageDelete', id, key, shared }, '*');
+            });
+          },
+          list: (prefix, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageList', id, prefix, shared }, '*');
+              storageReadsOut += 1;
+            });
+          }
+        };
+
+        let pendingBlobs = new Map();
+        URL.createObjectURL = (blob) => {
+          // Store the blob and create an ID and URL for it
+          const blobId = `blob-${Date.now()}-${Math.random()}`;
+          pendingBlobs.set(blobId, blob);
+          return `blob-request://${blobId}`;
+        };
+
+        URL.revokeObjectURL = (url) => {
+          // Remove the blob from our store
+          const blobId = url.replace("blob-request://", "");
+          pendingBlobs.delete(blobId);
+        };
+
+        const getBlobFromURL = (url) => {
+          const blobId = url.replace("blob-request://", "");
+          return pendingBlobs.get(blobId);
+        };
+
+        // Override global fetch with streaming support
+        window.fetch = (url, init = {}) => {
+          return new Promise((resolve, reject) => {
+            const id = newRequestId();
+            const channelId = `fetch-${id}-${Date.now()}`;
+            
+            callbacksMap.set(id, { 
+              resolve: (response) => {
+                // Null-body statuses: Response(stream, {status: 204}) throws
+                // per the Fetch spec, which would escape this resolver and
+                // hang the artifact's await forever.
+                if (response.status === 204 || response.status === 205 || response.status === 304) {
+                  try {
+                    resolve(new Response(null, {
+                      status: response.status,
+                      statusText: response.statusText,
+                      headers: response.headers
+                    }));
+                  } catch (err) {
+                    // Invalid statusText/header bytes can throw here too.
+                    reject(new TypeError(
+                      'Bridge fetch: unconstructable response (status ' + response.status + ')'
+                    ));
+                  }
+                  return;
+                }
+                // Create a ReadableStream for the response body
+                const stream = new ReadableStream({
+                  start(controller) {
+                    streamControllers.set(channelId, controller);
+                  },
+                  cancel() {
+                    streamControllers.delete(channelId);
+                  }
+                });
+                
+                // Create and return the Response with the stream. Response()
+                // requires status in [200, 599]; an opaque/no-cors fetch
+                // forwards status 0, which would throw here and escape the
+                // resolver, hanging the artifact's await. Surface it as a
+                // network-error-shaped rejection instead.
+                try {
+                  resolve(new Response(stream, {
+                    status: response.status,
+                    statusText: response.statusText,
+                    headers: response.headers
+                  }));
+                } catch (err) {
+                  streamControllers.delete(channelId);
+                  reject(new TypeError(
+                    'Bridge fetch: unconstructable response (status ' + response.status + ')'
+                  ));
+                }
+              },
+              reject,
+              channelId
+            });
+            
+            realParent.postMessage({
+              type: 'proxyFetch',
+              id,
+              url,
+              init,
+              channelId
+            }, '*');
+          });
+        };
+
+        window.addEventListener('message', async (event) => {
+          // Only the embedding parent may drive the bridge — sibling and
+          // nested frames can also postMessage into this window.
+          if (event.source !== realParent) return;
+          if (event.data.type === 'takeScreenshot') {
+            // Echo the request's nonce so the requester can correlate the
+            // reply to ITS request — a reply without the expected nonce
+            // (e.g. from a stale pre-remount artifact) is ignored upstream.
+            const screenshotNonce = event.data.nonce;
+            const rootElement = document.getElementById('artifacts-component-root-html');
+            if (!rootElement) {
+              realParent.postMessage({
+                type: 'screenshotError',
+                nonce: screenshotNonce,
+                error: new Error('Root element not found'),
+              }, '*');
+              return;
+            }
+            // Catch CDN load failures and toPng errors so the parent always
+            // gets a response instead of hanging forever.
+            try {
+              const htmlToImage = await loadHtmlToImage();
+              // Draws only the top, 630/1200 of the width tall, as the link preview is 1200x630. `height` also shortens html-to-image's copy of the root and
+              // what its % min- and max-height resolve against, which moves centred content; `style` undoes that. Keep in step with app/page.tsx.
+              const previewHeight = Math.ceil((rootElement.offsetWidth * 630) / 1200);
+              const screenshot = await htmlToImage.toPng(rootElement, {
+                ...(rootElement.offsetHeight > previewHeight && {
+                  height: previewHeight,
+                  style: { height: window.getComputedStyle(rootElement).height, minHeight: '0', maxHeight: 'none' },
+                }),
+                imagePlaceholder:
+                  "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAAXNSR0IArs4c6QAAAA1JREFUGFdjePDgwX8ACOQDoNsk0PMAAAAASUVORK5CYII=",
+              });
+              realParent.postMessage({
+                type: 'screenshotData',
+                nonce: screenshotNonce,
+                data: screenshot,
+              }, '*');
+            } catch (err) {
+              realParent.postMessage({
+                type: 'screenshotError',
+                nonce: screenshotNonce,
+                error: err instanceof Error ? err : new Error(String(err)),
+              }, '*');
+            }
+          } else if (event.data.type === 'claudeComplete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.completion);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'proxyFetchResponse') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+              callbacksMap.delete(event.data.id);
+            } else {
+              // Initial response with headers, status, etc.
+              callback.resolve({
+                status: event.data.status,
+                statusText: event.data.statusText,
+                headers: event.data.headers
+              });
+              // Don't delete the callback yet if streaming
+              if (!event.data.body) {
+                callbacksMap.delete(event.data.id);
+              }
+            }
+          } else if (event.data.type === 'proxyFetchStream') {
+            // Handle streaming data chunks
+            const controller = streamControllers.get(event.data.channelId);
+            if (controller) {
+              if (event.data.error) {
+                controller.error(new Error(event.data.error));
+                streamControllers.delete(event.data.channelId);
+              } else if (event.data.done) {
+                controller.close();
+                streamControllers.delete(event.data.channelId);
+                // Clean up the callback
+                const callback = Array.from(callbacksMap.entries()).find(
+                  ([_, value]) => value.channelId === event.data.channelId
+                );
+                if (callback) {
+                  callbacksMap.delete(callback[0]);
+                }
+              } else if (event.data.chunk) {
+                controller.enqueue(new Uint8Array(event.data.chunk));
+              }
+            }
+          } else if (event.data.type === 'storageGet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            storageReadsOut -= 1;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageSet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageDelete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageList') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            storageReadsOut -= 1;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          }
+        });
+
+        // An SVG <a> exposes href as an SVGAnimatedString; its baseVal is the attribute
+        // as written, so resolve it against the base URL as the browser does for an HTML <a>.
+        const resolvedHref = (linkEl) => {
+          if (typeof linkEl.href === "string") return linkEl.href;
+          const written = linkEl.href?.baseVal;
+          // A same-document SVG link, such as one that begins an animation, stays with the browser.
+          if (!written || written.trim().startsWith("#")) return "";
+          try {
+            return new RealURL(written, linkEl.baseURI).href;
+          } catch (error) {
+            return written;
+          }
+        };
+
+        // This frame's URL is about:srcdoc, so the browser resolves "#id" against the renderer
+        // page and would load that page in the frame instead of scrolling.
+        const sameDocumentFragment = (linkEl) => {
+          const written = linkEl.getAttribute("href")?.trim();
+          if (!written?.startsWith("#") || document.querySelector("base[href]")) return null;
+          return written.slice(1);
+        };
+
+        const scrollToFragment = (fragment) => {
+          let decoded = fragment;
+          try {
+            decoded = realDecodeURIComponent(fragment);
+          } catch (error) {}
+          let target = document.getElementById(fragment) ?? document.getElementById(decoded);
+          for (const named of target ? [] : document.getElementsByName(decoded)) {
+            if (named.localName === "a") {
+              target = named;
+              break;
+            }
+          }
+          if (target) {
+            target.scrollIntoView();
+          } else if (decoded.toLowerCase() === "top") {
+            window.scrollTo(0, 0);
+          } else {
+            return false;
+          }
+          return true;
+        };
+
+        // Same decoder as dataUrlFile in app/page.tsx; change both together.
+        const hexPair = /^[0-9a-f]{2}$/i;
+        const dataUrlFile = (href) => {
+          const hash = href.indexOf("#");
+          const url = hash === -1 ? href : href.slice(0, hash);
+          const comma = url.indexOf(",");
+          if (comma === -1) return null;
+          const header = url.slice(0, comma);
+          const payload = url.slice(comma + 1);
+          const mimeMatch = header.match(/data:([^;]+)/);
+          const mimeType = mimeMatch ? mimeMatch[1] : "application/octet-stream";
+          const declaredBase64 = header
+            .split(";")
+            .slice(1)
+            .some((param) => param.trim().toLowerCase() === "base64");
+          const type = mimeMatch ? mimeMatch[1].trim().toLowerCase() : "";
+          const binaryType = type !== "" && !type.startsWith("text/");
+          if (declaredBase64 || (binaryType && !payload.includes("%"))) {
+            let binary = null;
+            try {
+              binary = realAtob(
+                payload.replace(/%([0-9a-f]{2})/gi, (_, hex) => String.fromCharCode(parseInt(hex, 16))),
+              );
+            } catch (error) {
+              if (declaredBase64) return null;
+            }
+            if (binary !== null) {
+              const bytes = new Uint8Array(binary.length);
+              for (let i = 0; i < binary.length; i++) {
+                bytes[i] = binary.charCodeAt(i);
+              }
+              return { mimeType, data: bytes.buffer };
+            }
+          }
+          const input = new RealTextEncoder().encode(payload);
+          const bytes = new Uint8Array(input.length);
+          let length = 0;
+          for (let i = 0; i < input.length; i++) {
+            if (input[i] === 0x25 && i + 2 < input.length) {
+              const pair = String.fromCharCode(input[i + 1], input[i + 2]);
+              if (hexPair.test(pair)) {
+                bytes[length++] = parseInt(pair, 16);
+                i += 2;
+                continue;
+              }
+            }
+            bytes[length++] = input[i];
+          }
+          return { mimeType, data: bytes.slice(0, length).buffer };
+        };
+
+        const onLinkClick = (event) => {
+          // Not instanceof Element: an artifact's own top-level class Element shadows the global.
+          if (typeof event.target?.closest !== "function") return;
+    
+          const linkEl = event.target.closest("a");
+          const href = linkEl && resolvedHref(linkEl);
+          if (!href) return;
+
+          const fragment = sameDocumentFragment(linkEl);
+          if (fragment !== null) {
+            const handledByArtifact = event.defaultPrevented;
+            event.preventDefault();
+            if (handledByArtifact || fragment === "" || scrollToFragment(fragment)) return;
+            // A fragment that names nothing in the artifact may name something in the host,
+            // such as a project thread. The artifact's own listeners still see the click.
+            realParent.postMessage({ type: 'openExternal', href }, '*');
+            return;
+          }
+          const filename = linkEl.getAttribute("download") ?? "";
+    
+          event.preventDefault();
+          event.stopImmediatePropagation();
+    
+          if (href.startsWith("blob-request:")) {
+            const blob = getBlobFromURL(href);
+            if (!blob) return;
+            void blob.arrayBuffer().then((data) => {
+              realParent.postMessage({
+                type: "downloadFile",
+                filename,
+                data,
+                mimeType: blob.type || "application/octet-stream",
+              });
+            });
+          } else if (href.startsWith("data:")) {
+            const file = dataUrlFile(href);
+            if (!file) return;
+            realParent.postMessage({
+              type: "downloadFile",
+              filename,
+              data: file.data,
+              mimeType: file.mimeType,
+            });
+          } else {
+            let linkUrl;
+            try {
+              linkUrl = new URL(href);
+            } catch (error) {
+              return;
+            }
+    
+            if (linkUrl.hostname === window.location.hostname) return;
+      
+            realParent.postMessage({
+              type: 'openExternal',
+              href,
+            }, '*');
+          }
+        };
+        window.addEventListener('click', onLinkClick);
+
+        // HACK: a click on an <a download> that is not in the document, or a dispatched click that does not bubble, never reaches the window
+        // listener, so the link gets a listener of its own while its click() or dispatchEvent() runs, after the artifact's. Change with app/page.tsx.
+        const RealAnchor = window.HTMLAnchorElement;
+        const RealMouseEvent = window.MouseEvent;
+        const anchorProto = RealAnchor?.prototype;
+        const superProto = anchorProto && Object.getPrototypeOf(anchorProto);
+        if (typeof RealAnchor === 'function' && typeof RealMouseEvent === 'function' && typeof superProto?.click === 'function' && typeof superProto?.dispatchEvent === 'function') {
+          const onMissedClick = (event) => {
+            if (!event.defaultPrevented) onLinkClick(event);
+          };
+          // Links whose click() or dispatchEvent() is running, so a call made during it leaves the outer call's listener in place.
+          const listening = new WeakSet();
+          const callHearingMissed = (anchor, bubbles, call) => {
+            if (!(anchor instanceof RealAnchor) || !anchor.hasAttribute('download') || (anchor.isConnected && bubbles) || listening.has(anchor)) {
+              return call();
+            }
+            listening.add(anchor);
+            anchor.addEventListener('click', onMissedClick);
+            try {
+              return call();
+            } finally {
+              listening.delete(anchor);
+              anchor.removeEventListener('click', onMissedClick);
+            }
+          };
+          anchorProto.click = function () {
+            return callHearingMissed(this, true, () => superProto.click.call(this));
+          };
+          anchorProto.dispatchEvent = function (event) {
+            const call = () => superProto.dispatchEvent.call(this, event);
+            return event instanceof RealMouseEvent && event.type === 'click' ? callHearingMissed(this, event.bubbles, call) : call();
+          };
+        }
+
+        const originalOpen = window.open;
+        window.open = function (url) {
+          realParent.postMessage({
+            type: "openExternal",
+            href: url,
+          }, "*");
+        };
+
+        window.addEventListener('error', (event) => {
+          realParent.postMessage({ type: 'console', message: 'Uncaught Error: ' + event.message }, '*');
+        });
+
+        // Last, so that if this throws, everything above is already set up. In its own function, so that its names stay local.
+        (() => {
+          function forwardConsole(e,r){const c=String,f=Reflect.apply;let i=0;const p=n=>i>3&&(typeof n=="function"||typeof n=="object"&&n!==null)?"[object Object]":n,s=n=>{try{return c(n??"")}catch{return"[object Object]"}},u=[["log",""],["error","Error: "],["warn","Warning: "]];for(const[n,y]of u){const h=e[n];e[n]=(...o)=>{let l=y;i+=1;try{for(let t=0;t<o.length;t+=1)o[t]=p(o[t]);f(h,e,o);for(let t=0;t<o.length;t+=1)l+=(t===0?"":" ")+s(o[t])}finally{i-=1}r(l)}}}
+          forwardConsole(window.console, (line) => realParent.postMessage({ type: 'console', message: line }, '*'));
+        })();
+      })();
+    </script>
+  <style id="claude-scrollbar">@layer claude-scrollbar{*{scrollbar-width:thin}html{scrollbar-color:rgb(128 128 128 / 50%) transparent}}</style><script>
+(function () {
+  "use strict";
+  if (window.__coworkHtmlReviewGuest) return;
+  window.__coworkHtmlReviewGuest = true;
+
+  var READY_TYPE = "__cowork_html_review_ready__";
+  var SEL_CLASS = "__cwhr-sel";
+  var CONTEXT_LEN = 32;
+  var EXACT_CAP = 1000;
+  var port = null;
+  var mode = false;
+  var pins = [];
+  var quotes = [];
+  // Resolved Range per quote id; invalidated on DOM mutation and on a
+  // fresh quotes set. Scroll/resize re-reports just re-read
+  // getClientRects() from the cached Range. Null prototype - ids are
+  // collaborator-writable and must not collide with Object.prototype.
+  var quoteRanges = Object.create(null);
+  var hoverEl = null;
+  var selected = null;
+  var hasTextSel = false;
+  var rafPending = false;
+  // Capture before page body scripts can shadow them; start() defers
+  // to DOMContentLoaded which page code can race.
+  var _MessageChannel = window.MessageChannel;
+  var _topPost = window.top.postMessage.bind(window.top);
+
+  function visibleText(el) {
+    // innerText drops display:none/visibility:hidden subtrees; keep an
+    // empty innerText (icon-only el) rather than falling through to
+    // textContent which would re-include hidden text.
+    var t = typeof el.innerText === "string" ? el.innerText : (el.textContent || "");
+    return t.replace(/\s+/g, " ").trim();
+  }
+
+  // Comment-mode cursor: see HTML_PREVIEW_COMMENT_CURSOR above.
+  var BUBBLE_CURSOR = "url(\"data:image/svg+xml,%3Csvg%20xmlns%3D'http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg'%20width%3D'24'%20height%3D'24'%20viewBox%3D'0%200%2024%2024'%3E%3Cpath%20d%3D'M12%20.5h0A11.5%2011.5%200%200%201%2023.5%2012v0A11.5%2011.5%200%200%201%2012%2023.5H2.5a2%202%200%200%201-2-2V12A11.5%2011.5%200%200%201%2012%20.5Z'%20fill%3D'%23fff'%20stroke%3D'rgba(0%2C0%2C0%2C0.22)'%20stroke-width%3D'1'%2F%3E%3C%2Fsvg%3E\") 1 23, url(\"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABgAAAAYCAYAAADgdz34AAACjklEQVR4AbRWS2gaURR9TGpiFTUEWpKQkA+EruqizWcRSBRT/G8KKpXiyo0ra1fVNiDFLmypFUo3iht/iO4Uay1FGwtFECl1p6KWLly4CGqrSMTY+wRFQ7WhGYd7Zu697845b+7M8B6BJh+UxcXFG3a7XeTxeHQAC+C12+1+ZLPZhHgMbp8FjLWxAkaj8U48Hg8lEomfIpEoLBaLLTKZTAd4LJFI3kD8HsZ+xGKxoMFgYI9T+JvAtUAg8FylUn3hcDj8ra0t6vLyMmKxWIhCofSAfZyDMRqXy+Wr1eqvPp/vKYjMAEZsRMDpdN6MRCKf+Xz+8cbGBm2kckIAtXShUGgKh8Mnfr9/Ybh0IKDT6a4vLS19EggE+wwGY7jmUj6TyUTQyv35+fmP0MbBexkISKVS+97e3u1LsU0oAo67Go3G1i/pCZjN5t3Nzc0H/zPzPlH/ip8EWvbQYrHs4hwWmN3e3n62traGfZy7MtbX12fYbPYTIKIQOzs7C6urq/cgINVWVlaO4EtjEXq9nken06mksgMZtJthtVp5xNzcHBsEIEWu0Wg0RKVS2USz2WTigFx6hPCkMTfRarXgB6WQzd/j63Q6bdK+nB7j0KnRaCCCIMpTE4D2oEql8m1qAvV6/VSr1U5PIJvN+qFjv6fyBIVC4ZfD4XgJAmekC9RqNZROp1+FQqESCCDSBWCVO1EoFC8wOQZpAnjm0Wj0O/xX94H4HNAzotvtNnreFU6lUgllMplAMpnclcvlp8NURC6Xi8BLGc5N9NvtNqpWq6hcLqN8Pn8OLUkAMe/g4EAOG4WzizcTJpPpA6zFIpfL9Ra2I45/IRgM2lKp1LtisXjs9XpvHR4eHimVythF4n78BwAA//8r8OPFAAAABklEQVQDAPCY8Oae0TJxAAAAAElFTkSuQmCC\") 1 23, default";
+
+  function injectStyle() {
+    var style = document.createElement("style");
+    // Hover box is painted by the host (from streamed rects); the guest
+    // marks the selected element and, in comment mode, swaps the native
+    // cursor for the comment bubble (forced, so page cursor styles don't
+    // fight the picker). While a composer or thread card is open the arrow
+    // returns, so the bubble cursor and the pin just placed never show at
+    // once. Keyed on <html> data attributes, which page scripts that
+    // rewrite body.className leave alone; ":not(#_)" lifts the rules to
+    // id-level specificity so a page's own !important cursor rules lose.
+    var ANY = ":not(#__cwhr_)";
+    var MODE = "html[data-cwhr-mode]";
+    var COMPOSING = MODE + "[data-cwhr-composing]";
+    style.textContent =
+      "." + SEL_CLASS + "{outline:1px solid hsl(40 70% 40%) !important;outline-offset:0;}" +
+      MODE + ANY + "," + MODE + " " + ANY + "{cursor:" + BUBBLE_CURSOR + " !important;}" +
+      COMPOSING + ANY + "," + COMPOSING + " " + ANY + "{cursor:default !important;}";
+    (document.head || document.documentElement).appendChild(style);
+  }
+
+  function isUnique(sel) {
+    try {
+      return document.querySelectorAll(sel).length === 1;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  // Mirrors the host's stripInvisibles ranges. The host strips these
+  // from stored selectors, so a selector built on a value containing
+  // them would validate here but never match again - skip those rungs
+  // and fall through to the structural ladder instead.
+  function hasInvisibles(s) {
+    for (var i = 0; i < s.length; i++) {
+      var c = s.codePointAt(i);
+      if (c > 0xffff) i++;
+      if (
+        c <= 0x1f ||
+        c === 0x061c ||
+        c === 0x070f ||
+        c === 0xad ||
+        (c >= 0x7f && c <= 0x9f) ||
+        c === 0x115f ||
+        c === 0x1160 ||
+        c === 0x180e ||
+        (c >= 0x200b && c <= 0x200f) ||
+        (c >= 0x202a && c <= 0x202e) ||
+        (c >= 0x2060 && c <= 0x2064) ||
+        (c >= 0x2066 && c <= 0x2069) ||
+        c === 0x3164 ||
+        c === 0xfeff ||
+        (c >= 0xfff9 && c <= 0xfffb) ||
+        c === 0xffa0 ||
+        (c >= 0xe0000 && c <= 0xe007f)
+      ) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  function escapeAttr(v) {
+    return String(v).replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+  }
+
+  // Selector ladder: unique #id -> unique [data-*] -> structural
+  // tag:nth-of-type path rooted at the nearest unique-id ancestor.
+  function selectorFor(el) {
+    if (el.id && !hasInvisibles(el.id) && isUnique("#" + CSS.escape(el.id))) {
+      return "#" + CSS.escape(el.id);
+    }
+    for (var i = 0; i < el.attributes.length; i++) {
+      var attr = el.attributes[i];
+      if (
+        attr.name.indexOf("data-") === 0 &&
+        attr.value &&
+        !hasInvisibles(attr.value)
+      ) {
+        var dataSel = "[" + attr.name + '="' + escapeAttr(attr.value) + '"]';
+        if (isUnique(dataSel)) return dataSel;
+      }
+    }
+    var parts = [];
+    var cur = el;
+    while (cur && cur !== document.body && cur.nodeType === 1 && parts.length < 10) {
+      var sel = cur.tagName.toLowerCase();
+      var parent = cur.parentElement;
+      if (parent) {
+        var sameTag = [];
+        for (var c = 0; c < parent.children.length; c++) {
+          if (parent.children[c].tagName === cur.tagName) sameTag.push(parent.children[c]);
+        }
+        if (sameTag.length > 1) {
+          sel += ":nth-of-type(" + (sameTag.indexOf(cur) + 1) + ")";
+        }
+      }
+      parts.unshift(sel);
+      if (
+        parent &&
+        parent.id &&
+        !hasInvisibles(parent.id) &&
+        isUnique("#" + CSS.escape(parent.id))
+      ) {
+        parts.unshift("#" + CSS.escape(parent.id));
+        return parts.join(" > ");
+      }
+      cur = parent;
+    }
+    if (cur === document.body) {
+      parts.unshift("body");
+      return parts.join(" > ");
+    }
+    // Depth cap hit without a root - an unrooted chain would match the
+    // first structural pattern anywhere in the document. Mark the pin
+    // detached instead of attaching it to the wrong element.
+    return ":not(*)";
+  }
+
+  function descriptorFor(el) {
+    var tag = "<" + el.tagName.toLowerCase() + ">";
+    var idPart = el.id ? " #" + el.id : "";
+    var text = visibleText(el).slice(0, 60);
+    var textPart = text ? ' "' + text + '"' : "";
+    // Nearest id'd ancestor, skipping the UCR-injected
+    // #artifacts-component-root-* wrapper which is implementation noise.
+    var section = el.parentElement;
+    while (
+      section &&
+      (!section.id || section.id.indexOf("artifacts-component-root") === 0)
+    ) {
+      section = section.parentElement;
+    }
+    var sectionPart = section && section.id ? " in #" + section.id : "";
+    return (tag + idPart + textPart + sectionPart).slice(0, 400);
+  }
+
+  // textContent offset of (node, offset) within body - the coordinate
+  // system text-quote anchors are stored in. -1 when the boundary
+  // isn't under body (shadow root, detached).
+  function textOffset(node, offset) {
+    var body = document.body;
+    if (!body) return -1;
+    try {
+      var pre = document.createRange();
+      pre.selectNodeContents(body);
+      pre.setEnd(node, offset);
+      return pre.toString().length;
+    } catch (e) {
+      return -1;
+    }
+  }
+
+  // Inverse: build a Range covering [start, end) in body.textContent.
+  function rangeForOffsets(start, end) {
+    var body = document.body;
+    if (!body) return null;
+    var walker = document.createTreeWalker(body, NodeFilter.SHOW_TEXT);
+    var acc = 0;
+    var range = document.createRange();
+    var haveStart = false;
+    var t;
+    while ((t = walker.nextNode())) {
+      var next = acc + t.length;
+      if (!haveStart && start < next) {
+        range.setStart(t, start - acc);
+        haveStart = true;
+      }
+      if (haveStart && end <= next) {
+        range.setEnd(t, end - acc);
+        return range;
+      }
+      acc = next;
+    }
+    return null;
+  }
+
+  // Context-scored search (W3C text-quote resolution): slice-check the
+  // hint, else pick the occurrence whose surrounding chars best match
+  // prefix/suffix. MIRRORS locateTextQuote() above line-for-line - the
+  // tested export is the contract; this copy is what the sandbox runs.
+  function locateQuote(text, q) {
+    var ex = q.exact;
+    if (!ex) return null;
+    var hint = q.startOffset >= 0 ? q.startOffset : 0;
+    if (text.slice(hint, hint + ex.length) === ex) {
+      return { start: hint, end: hint + ex.length };
+    }
+    var best = -1;
+    var bestScore = -1;
+    var bestDist = Infinity;
+    var scanned = 0;
+    for (var idx = text.indexOf(ex); idx !== -1 && ++scanned <= 1000; idx = text.indexOf(ex, idx + 1)) {
+      var before = text.slice(Math.max(0, idx - CONTEXT_LEN), idx);
+      var after = text.slice(idx + ex.length, idx + ex.length + CONTEXT_LEN);
+      var sc = 0;
+      for (var i = 1; i <= q.prefix.length && i <= before.length; i++) {
+        if (q.prefix[q.prefix.length - i] !== before[before.length - i]) break;
+        sc++;
+      }
+      for (var j = 0; j < q.suffix.length && j < after.length; j++) {
+        if (q.suffix[j] !== after[j]) break;
+        sc++;
+      }
+      var dist = Math.abs(idx - hint);
+      if (sc > bestScore || (sc === bestScore && dist < bestDist)) {
+        best = idx;
+        bestScore = sc;
+        bestDist = dist;
+      }
+    }
+    return best === -1 ? null : { start: best, end: best + ex.length };
+  }
+
+  function collectLineRects(range, cap) {
+    var out = [];
+    var rects = range.getClientRects();
+    for (var i = 0; i < rects.length && out.length < cap; i++) {
+      var r = rects[i];
+      if (r.width > 0 && r.height > 0) {
+        out.push({ x: r.left, y: r.top, w: r.width, h: r.height });
+      }
+    }
+    return out;
+  }
+
+  function reportTextSel(full) {
+    if (!port) return;
+    var sel = window.getSelection();
+    var r = sel && !sel.isCollapsed && sel.rangeCount > 0 ? sel.getRangeAt(0) : null;
+    if (!r || !document.body || !document.body.contains(r.commonAncestorContainer)) {
+      if (hasTextSel) {
+        hasTextSel = false;
+        port.postMessage({ type: "textClear" });
+      }
+      return;
+    }
+    hasTextSel = true;
+    var br = r.getBoundingClientRect();
+    var msg = {
+      type: "textCapture",
+      rect: { x: br.left, y: br.top, w: br.width, h: br.height },
+      lineRects: collectLineRects(r, 80),
+    };
+    if (full) {
+      var live = document.body.textContent || "";
+      var so = textOffset(r.startContainer, r.startOffset);
+      var eo = textOffset(r.endContainer, r.endOffset);
+      if (so < 0 || eo < 0 || eo <= so) {
+        // Unanchorable selection (shadow root, foreign node). A
+        // rect-only post here would make the host pair the new rect
+        // with a stale prior anchor - clear instead.
+        hasTextSel = false;
+        port.postMessage({ type: "textClear" });
+        return;
+      }
+      // Denomination invariant: exact/prefix/suffix are byte-identical
+      // slices of body.textContent. Truncation adjusts endOffset so
+      // the host's (endOffset - startOffset === exact.length) shape
+      // check holds. Cut points back off surrogate halves - a lone
+      // surrogate would never relocate and fails UTF-8 persist.
+      var capped = Math.min(eo, so + EXACT_CAP);
+      if (capped < eo) {
+        var hc = live.charCodeAt(capped - 1);
+        if (hc >= 0xd800 && hc <= 0xdbff) capped--;
+      }
+      if (capped <= so) {
+        port.postMessage(msg);
+        return;
+      }
+      var pStart = Math.max(0, so - CONTEXT_LEN);
+      var pc = live.charCodeAt(pStart);
+      if (pc >= 0xdc00 && pc <= 0xdfff) pStart++;
+      var sEnd = Math.min(live.length, capped + CONTEXT_LEN);
+      if (sEnd < live.length) {
+        var sc = live.charCodeAt(sEnd - 1);
+        if (sc >= 0xd800 && sc <= 0xdbff) sEnd--;
+      }
+      msg.exact = live.slice(so, capped);
+      msg.prefix = live.slice(pStart, so);
+      msg.suffix = live.slice(capped, sEnd);
+      msg.startOffset = so;
+      msg.endOffset = capped;
+    }
+    port.postMessage(msg);
+  }
+
+  function clearSelection() {
+    if (selected) {
+      selected.classList.remove(SEL_CLASS);
+      selected = null;
+    }
+  }
+
+  // rAF-throttled cursor + hover-rect stream so the host can paint the
+  // inspector hover box (and knows the pointer is present) in comment mode.
+  var cursorPending = false;
+  var cursorX = -1;
+  var cursorY = -1;
+  function flushCursor() {
+    cursorPending = false;
+    if (!port) return;
+    var hover = null;
+    if (
+      hoverEl &&
+      hoverEl.nodeType === 1 &&
+      hoverEl !== document.body &&
+      hoverEl !== document.documentElement
+    ) {
+      var r = hoverEl.getBoundingClientRect();
+      if (r.width > 0 || r.height > 0) {
+        hover = { x: r.left, y: r.top, w: r.width, h: r.height };
+      }
+    }
+    port.postMessage({ type: "cursor", x: cursorX, y: cursorY, hover: hover });
+  }
+  function scheduleCursor() {
+    if (!cursorPending) {
+      cursorPending = true;
+      requestAnimationFrame(flushCursor);
+    }
+  }
+  function onMouseMove(ev) {
+    if (!mode || !port) return;
+    // Over the scrollbar gutter (clientX/Y past the content box) - hide
+    // the hover box like a leave.
+    var de = document.documentElement;
+    if (ev.clientX >= de.clientWidth || ev.clientY >= de.clientHeight) {
+      cursorX = -1;
+      cursorY = -1;
+      hoverEl = null;
+      scheduleCursor();
+      return;
+    }
+    cursorX = ev.clientX;
+    cursorY = ev.clientY;
+    hoverEl = ev.target;
+    scheduleCursor();
+  }
+  function onMouseLeave() {
+    if (!mode || !port) return;
+    cursorX = -1;
+    cursorY = -1;
+    hoverEl = null;
+    scheduleCursor();
+  }
+
+  function onClick(ev) {
+    if (!port) return;
+    if (!mode) {
+      // Mode off: don't intercept the page, just let the host close any
+      // open popover (thread card click-away). A non-collapsed selection
+      // means the click ended a drag-select - not a click-away.
+      var s = window.getSelection();
+      if (!s || s.isCollapsed) port.postMessage({ type: "clickAway" });
+      return;
+    }
+    ev.preventDefault();
+    ev.stopImmediatePropagation();
+    var el = ev.target;
+    if (!el || el.nodeType !== 1 || el === document.documentElement) return;
+    if (el === document.body && el.firstElementChild) {
+      // Pin on body is rarely intentional; keep it anyway but as body.
+    }
+    clearSelection();
+    selected = el;
+    el.classList.add(SEL_CLASS);
+    var rect = el.getBoundingClientRect();
+    var pinX = rect.width > 0 ? (ev.clientX - rect.left) / rect.width : 0.5;
+    var pinY = rect.height > 0 ? (ev.clientY - rect.top) / rect.height : 0.5;
+    port.postMessage({
+      type: "capture",
+      selector: selectorFor(el).slice(0, 1000),
+      textHint: visibleText(el).slice(0, 300),
+      descriptor: descriptorFor(el),
+      pinX: Math.min(1, Math.max(0, pinX)),
+      pinY: Math.min(1, Math.max(0, pinY)),
+      clientX: ev.clientX,
+      clientY: ev.clientY,
+      rectLeft: rect.left,
+      rectTop: rect.top,
+    });
+  }
+
+  function reportRects() {
+    rafPending = false;
+    if (!port) return;
+    // Selected element's live bounds - keeps the host's draft pin /
+    // inspector tag / composer glued through scroll and reflow.
+    if (selected) {
+      var sr = selected.getBoundingClientRect();
+      port.postMessage({
+        type: "selRect",
+        left: sr.left,
+        top: sr.top,
+        w: sr.width,
+        h: sr.height,
+        found:
+          (sr.width > 0 || sr.height > 0) &&
+          document.documentElement.contains(selected),
+      });
+    }
+    var rects = [];
+    for (var i = 0; i < pins.length; i++) {
+      var p = pins[i];
+      var el = null;
+      try {
+        el = document.querySelector(p.selector);
+      } catch (e) {
+        el = null;
+      }
+      if (!el) {
+        rects.push({ id: p.id, x: 0, y: 0, found: false });
+        continue;
+      }
+      var r = el.getBoundingClientRect();
+      if (r.width === 0 && r.height === 0) {
+        rects.push({ id: p.id, x: 0, y: 0, found: false });
+        continue;
+      }
+      rects.push({
+        id: p.id,
+        x: r.left + p.pinX * r.width,
+        y: r.top + p.pinY * r.height,
+        found: true,
+      });
+    }
+    var quoteRects = [];
+    if (quotes.length > 0) {
+      var live = null;
+      for (var qi = 0; qi < quotes.length; qi++) {
+        var q = quotes[qi];
+        var qr = quoteRanges[q.id];
+        if (qr === undefined) {
+          if (live === null) {
+            live = (document.body && document.body.textContent) || "";
+          }
+          var loc = locateQuote(live, q);
+          qr = (loc && rangeForOffsets(loc.start, loc.end)) || null;
+          quoteRanges[q.id] = qr;
+        }
+        // Zero paintable rects (display:none subtree) reports as
+        // not-found so the host docks it as detached instead of
+        // rendering nothing clickable.
+        var qlr = qr ? collectLineRects(qr, 80) : [];
+        quoteRects.push(
+          qlr.length > 0
+            ? { id: q.id, found: true, lineRects: qlr }
+            : { id: q.id, found: false, lineRects: [] }
+        );
+      }
+    }
+    port.postMessage({
+      type: "rects",
+      rects: rects,
+      quoteRects: quoteRects,
+      scrollY: window.scrollY || 0,
+    });
+  }
+
+  function scheduleRects() {
+    if (rafPending) return;
+    rafPending = true;
+    var done = false;
+    function run() {
+      if (done) return;
+      done = true;
+      reportRects();
+    }
+    // rAF for paint alignment, with a timeout fallback - rAF is
+    // suspended entirely in hidden tabs and pins must still settle
+    // when the tab becomes visible after background loading.
+    requestAnimationFrame(run);
+    setTimeout(run, 150);
+  }
+
+  function setMode(on) {
+    mode = !!on;
+    document.documentElement.toggleAttribute("data-cwhr-mode", mode);
+    if (!mode) {
+      hoverEl = null;
+      clearSelection();
+    }
+  }
+
+  function setComposing(open) {
+    document.documentElement.toggleAttribute("data-cwhr-composing", !!open);
+  }
+
+  function onPortMessage(ev) {
+    var data = ev.data;
+    if (!data) return;
+    if (data.type === "mode") setMode(data.on);
+    else if (data.type === "composing") setComposing(data.open);
+    else if (data.type === "pins") {
+      pins = Array.isArray(data.pins) ? data.pins : [];
+      scheduleRects();
+    } else if (data.type === "quotes") {
+      quotes = Array.isArray(data.quotes) ? data.quotes : [];
+      quoteRanges = Object.create(null);
+      scheduleRects();
+    } else if (data.type === "clearSelection") {
+      clearSelection();
+    } else if (data.type === "clearTextSel") {
+      var ts = window.getSelection();
+      if (ts) ts.removeAllRanges();
+      hasTextSel = false;
+    } else if (data.type === "restoreScroll") {
+      var ry = Number(data.y);
+      if (isFinite(ry) && ry > 0) {
+        // Apply now and again at load - late images/fonts can grow the
+        // document after the first attempt clamps short.
+        window.scrollTo(0, ry);
+        window.addEventListener("load", function () {
+          window.scrollTo(0, ry);
+        });
+      }
+    }
+  }
+
+  function start() {
+    injectStyle();
+    var channel = new _MessageChannel();
+    port = channel.port1;
+    port.onmessage = onPortMessage;
+    // Sandboxed srcdoc origins can be opaque; "*" is required. The
+    // payload carries only the mount token (multiple sandboxes can be
+    // mounted at once - the token routes the port to the right overlay)
+    // and the channel port itself is pairwise-secure.
+    _topPost(
+      { type: READY_TYPE, token: "027d442f-c30c-4849-b6ac-4bd24e735024" },
+      "*",
+      [channel.port2]
+    );
+    document.addEventListener("mousemove", onMouseMove, true);
+    // documentElement (not document, capture) so this fires only when the
+    // pointer leaves the viewport - capture-phase on document would fire for
+    // every intra-document element-boundary crossing.
+    document.documentElement.addEventListener("mouseleave", onMouseLeave);
+    document.addEventListener("click", onClick, true);
+    // Text-selection capture: commit on mouseup/keyup (Shift+Arrow),
+    // clear on collapse. Not mode-gated; highlight-to-comment is
+    // always on.
+    function onSelCommit() { reportTextSel(true); }
+    document.addEventListener("mouseup", onSelCommit, true);
+    document.addEventListener("keyup", onSelCommit, true);
+    document.addEventListener("selectionchange", function () {
+      var s = window.getSelection();
+      if (hasTextSel && (!s || s.isCollapsed)) reportTextSel(false);
+    });
+    document.addEventListener("keydown", function (ev) {
+      if (ev.key === "Escape" && port) port.postMessage({ type: "dismiss" });
+    }, true);
+    // Scroll/resize move the hovered element under a stationary pointer -
+    // re-report its rect so the host's inspector box tracks it. Mutations
+    // stay rects-only (animating pages would chatter the cursor stream).
+    var textSelPending = false;
+    function scheduleTextSel() {
+      if (textSelPending) return;
+      textSelPending = true;
+      requestAnimationFrame(function () {
+        textSelPending = false;
+        reportTextSel(false);
+      });
+    }
+    function onLayoutChange() {
+      scheduleRects();
+      if (mode && hoverEl) scheduleCursor();
+      if (hasTextSel) scheduleTextSel();
+    }
+    window.addEventListener("scroll", onLayoutChange, true);
+    window.addEventListener("resize", onLayoutChange);
+    // Full-cache invalidate per childList mutation is acceptable: CSS
+    // animation doesn't fire the observer; JS writers at frame rate
+    // would re-relocate every frame but are rare. characterData isn't
+    // observed, so .data= edits leave highlights stale until the next
+    // childList mutation.
+    var observer = new MutationObserver(function () {
+      quoteRanges = Object.create(null);
+      scheduleRects();
+      if (hasTextSel) scheduleTextSel();
+    });
+    function observe() {
+      if (document.body) observer.observe(document.body, { childList: true, subtree: true });
+    }
+    if (document.body) observe();
+    else document.addEventListener("DOMContentLoaded", observe);
+    // Settle pins after late layout (fonts, images).
+    setInterval(scheduleRects, 2000);
+  }
+
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", start);
+  } else {
+    start();
+  }
+})();
+</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Amostras de treinamento em bandas multiespectrais</title>
+<style>
+:root{--bg:#ffffff;--surface:#f6f5f0;--text:#2c2c2a;--text2:#5f5e5a;--border:#d3d1c7;--border-strong:#888780;--accent:#185FA5;--accent-bg:#E6F1FB;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
+@media (prefers-color-scheme: dark){:root:not([data-theme="light"]){--bg:#1f1e1c;--surface:#2c2c2a;--text:#f1efe8;--text2:#b4b2a9;--border:#444441;--border-strong:#888780;--accent:#85B7EB;--accent-bg:#0C447C}}
+:root[data-theme="dark"]{--bg:#1f1e1c;--surface:#2c2c2a;--text:#f1efe8;--text2:#b4b2a9;--border:#444441;--border-strong:#888780;--accent:#85B7EB;--accent-bg:#0C447C}
+html{scroll-padding-top:env(safe-area-inset-top,0px)}
+body{margin:0;background:var(--bg);color:var(--text);font-family:-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;line-height:1.5}
+main{max-width:720px;margin:0 auto;padding:16px}
+h1{font-size:22px;font-weight:500;margin:8px 0 4px}
+.sub{font-size:14px;color:var(--text2);margin:0 0 12px}
+.sr-only{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0,0,0,0)}
+.row{display:flex;flex-wrap:wrap;gap:8px;align-items:center;padding:0 0 6px}
+.chip{display:inline-flex;align-items:center;gap:6px;padding:6px 12px;border:0.5px solid var(--border-strong);border-radius:8px;background:var(--surface);color:var(--text);font-size:13px;cursor:pointer;font-family:inherit}
+.chip[aria-pressed="true"]{border-color:var(--accent);background:var(--accent-bg);color:var(--text)}
+.dot{width:10px;height:10px;border-radius:2px;display:inline-block}
+.cap{font-size:13px;color:var(--text2);margin:14px 0 4px}
+.lab{font-size:13px;color:var(--text2);padding:6px 4px 6px 0}
+svg text{font-family:inherit}
+.t{font-size:14px;fill:var(--text)}
+.ts{font-size:12px;fill:var(--text2)}
+.th{font-size:14px;font-weight:500;fill:var(--text)}
+.leader{stroke:var(--border-strong);stroke-width:.5;stroke-dasharray:3 3}
+.wrap{position:relative;width:100%}
+.wrap canvas{display:block;width:100%;height:auto}
+#zoom{display:flex;flex-wrap:wrap;gap:10px}
+.zl{font-size:12px;color:var(--text2);margin-bottom:4px}
+.zg{display:grid;grid-template-columns:repeat(5,23px);gap:1px;background:var(--border);padding:1px;width:max-content}
+.zc{height:22px;font-size:11px;font-family:ui-monospace,Menlo,Consolas,monospace;display:flex;align-items:center;justify-content:center}
+</style>
+<style>.__cwhr-sel{outline:1px solid hsl(40 70% 40%) !important;outline-offset:0;}html[data-cwhr-mode]:not(#__cwhr_),html[data-cwhr-mode] :not(#__cwhr_){cursor:url("data:image/svg+xml,%3Csvg%20xmlns%3D'http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg'%20width%3D'24'%20height%3D'24'%20viewBox%3D'0%200%2024%2024'%3E%3Cpath%20d%3D'M12%20.5h0A11.5%2011.5%200%200%201%2023.5%2012v0A11.5%2011.5%200%200%201%2012%2023.5H2.5a2%202%200%200%201-2-2V12A11.5%2011.5%200%200%201%2012%20.5Z'%20fill%3D'%23fff'%20stroke%3D'rgba(0%2C0%2C0%2C0.22)'%20stroke-width%3D'1'%2F%3E%3C%2Fsvg%3E") 1 23, url("data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABgAAAAYCAYAAADgdz34AAACjklEQVR4AbRWS2gaURR9TGpiFTUEWpKQkA+EruqizWcRSBRT/G8KKpXiyo0ra1fVNiDFLmypFUo3iht/iO4Uay1FGwtFECl1p6KWLly4CGqrSMTY+wRFQ7WhGYd7Zu697845b+7M8B6BJh+UxcXFG3a7XeTxeHQAC+C12+1+ZLPZhHgMbp8FjLWxAkaj8U48Hg8lEomfIpEoLBaLLTKZTAd4LJFI3kD8HsZ+xGKxoMFgYI9T+JvAtUAg8FylUn3hcDj8ra0t6vLyMmKxWIhCofSAfZyDMRqXy+Wr1eqvPp/vKYjMAEZsRMDpdN6MRCKf+Xz+8cbGBm2kckIAtXShUGgKh8Mnfr9/Ybh0IKDT6a4vLS19EggE+wwGY7jmUj6TyUTQyv35+fmP0MbBexkISKVS+97e3u1LsU0oAo67Go3G1i/pCZjN5t3Nzc0H/zPzPlH/ip8EWvbQYrHs4hwWmN3e3n62traGfZy7MtbX12fYbPYTIKIQOzs7C6urq/cgINVWVlaO4EtjEXq9nken06mksgMZtJthtVp5xNzcHBsEIEWu0Wg0RKVS2USz2WTigFx6hPCkMTfRarXgB6WQzd/j63Q6bdK+nB7j0KnRaCCCIMpTE4D2oEql8m1qAvV6/VSr1U5PIJvN+qFjv6fyBIVC4ZfD4XgJAmekC9RqNZROp1+FQqESCCDSBWCVO1EoFC8wOQZpAnjm0Wj0O/xX94H4HNAzotvtNnreFU6lUgllMplAMpnclcvlp8NURC6Xi8BLGc5N9NvtNqpWq6hcLqN8Pn8OLUkAMe/g4EAOG4WzizcTJpPpA6zFIpfL9Ra2I45/IRgM2lKp1LtisXjs9XpvHR4eHimVythF4n78BwAA//8r8OPFAAAABklEQVQDAPCY8Oae0TJxAAAAAElFTkSuQmCC") 1 23, default !important;}html[data-cwhr-mode][data-cwhr-composing]:not(#__cwhr_),html[data-cwhr-mode][data-cwhr-composing] :not(#__cwhr_){cursor:default !important;}</style></head>
+<body id="artifacts-component-root-html">
+<main>
+<h1>Amostras de treinamento em bandas multiespectrais</h1>
+<p class="sub">Figura interativa com dados sintéticos para a classificação supervisionada de imagens: cinco bandas da mesma área, sete amostras de treinamento irregulares e as assinaturas espectrais das classes.</p>
+<h2 class="sr-only">Cinco bandas espectrais simuladas da mesma área com sete amostras de treinamento irregulares, uma janela ampliada de 5 por 5 pixels mostrando os níveis de cinza em cada banda e o gráfico das assinaturas espectrais.</h2>
+<div class="row">
+<button class="chip" id="r-fine" aria-pressed="true" onclick="setRes(true)">Pixels 10× menores</button>
+<button class="chip" id="r-coarse" aria-pressed="false" onclick="setRes(false)">Pixels maiores (grade 32 × 16)</button>
+</div>
+<div class="row">
+<button class="chip" id="b-all" aria-pressed="true" onclick="sel('')">Todas as classes</button>
+<button class="chip" id="b-a" aria-pressed="false" onclick="sel('a')"><span class="dot" style="background:#378ADD"></span>Água (1)</button>
+<button class="chip" id="b-v" aria-pressed="false" onclick="sel('v')"><span class="dot" style="background:#639922"></span>Vegetação (3)</button>
+<button class="chip" id="b-u" aria-pressed="false" onclick="sel('u')"><span class="dot" style="background:#D85A30"></span>Área urbana (2)</button>
+<button class="chip" id="b-s" aria-pressed="false" onclick="sel('s')"><span class="dot" style="background:#BA7517"></span>Solo exposto (1)</button>
+</div>
+<div class="row">
+<span class="lab">Janela sobre a amostra:</span>
+<button class="chip" id="w0" aria-pressed="false" onclick="goSample(0)">Água 1</button>
+<button class="chip" id="w1" aria-pressed="false" onclick="goSample(1)">Veg. 1</button>
+<button class="chip" id="w2" aria-pressed="false" onclick="goSample(2)">Veg. 2</button>
+<button class="chip" id="w3" aria-pressed="false" onclick="goSample(3)">Veg. 3</button>
+<button class="chip" id="w4" aria-pressed="true" onclick="goSample(4)">Urb. 1</button>
+<button class="chip" id="w5" aria-pressed="false" onclick="goSample(5)">Urb. 2</button>
+<button class="chip" id="w6" aria-pressed="false" onclick="goSample(6)">Solo 1</button>
+</div>
+<div class="cap">Clique em qualquer ponto de uma banda para mover a janela (retângulo com contorno preto e branco)</div>
+<div class="wrap">
+<canvas id="cv" width="1360" height="1280"></canvas>
+<svg id="ov" viewBox="0 0 680 640" style="position:absolute;left:0;top:0;width:100%;height:100%;cursor:crosshair" role="img"><title>Amostras de treinamento e janela ampliada sobre as bandas simuladas</title><desc>Contornos das camadas, sete polígonos de treinamento irregulares, linhas tracejadas que os atravessam, rótulos das cinco bandas e a janela ampliada marcada em cada banda.</desc><polygon points="40,108 380,108 460,20 120,20" fill="none" stroke="var(--border-strong)" stroke-width="0.8"></polygon><polygon points="40,226 380,226 460,138 120,138" fill="none" stroke="var(--border-strong)" stroke-width="0.8"></polygon><polygon points="40,344 380,344 460,256 120,256" fill="none" stroke="var(--border-strong)" stroke-width="0.8"></polygon><polygon points="40,462 380,462 460,374 120,374" fill="none" stroke="var(--border-strong)" stroke-width="0.8"></polygon><polygon points="40,580 380,580 460,492 120,492" fill="none" stroke="var(--border-strong)" stroke-width="0.8"></polygon><line data-c="a" x1="124.39999999999999" y1="82.47999999999999" x2="124.39999999999999" y2="554.48" stroke="#378ADD" stroke-width="1.2" stroke-dasharray="3 3"></line><line data-c="v" x1="245.1142857142857" y1="39.988571428571426" x2="245.1142857142857" y2="511.98857142857145" stroke="#639922" stroke-width="1.2" stroke-dasharray="3 3"></line><line data-c="v" x1="352.28571428571433" y1="47.657142857142844" x2="352.28571428571433" y2="519.6571428571428" stroke="#639922" stroke-width="1.2" stroke-dasharray="3 3"></line><line data-c="v" x1="151.73333333333332" y1="39.94666666666667" x2="151.73333333333332" y2="511.94666666666666" stroke="#639922" stroke-width="1.2" stroke-dasharray="3 3"></line><line data-c="u" x1="229.33333333333334" y1="89.22666666666666" x2="229.33333333333334" y2="561.2266666666667" stroke="#D85A30" stroke-width="1.2" stroke-dasharray="3 3"></line><line data-c="u" x1="244.93333333333334" y1="64.58666666666666" x2="244.93333333333334" y2="536.5866666666667" stroke="#D85A30" stroke-width="1.2" stroke-dasharray="3 3"></line><line data-c="s" x1="345.93333333333334" y1="81.89333333333335" x2="345.93333333333334" y2="553.8933333333333" stroke="#BA7517" stroke-width="1.2" stroke-dasharray="3 3"></line><polygon data-c="a" points="66.6,97.44 104.20000000000002,100.96000000000001 141.20000000000002,93.92 145.6,81.6 175.6,71.04 154.8,64 116,69.28 91.2,81.6" fill="#378ADD" fill-opacity="0.15" stroke="#378ADD" stroke-width="1.8" stroke-linejoin="round"></polygon><polygon data-c="v" points="196.4,48.16 225.6,53.44 269.6,49.92 292.8,39.36 282,28.799999999999997 243.6,26.159999999999997 205.8,34.08" fill="#639922" fill-opacity="0.15" stroke="#639922" stroke-width="1.8" stroke-linejoin="round"></polygon><polygon data-c="v" points="310.79999999999995,56.96 341.59999999999997,60.48 382,53.44 398.4,42.88 377.6,35.84 342,37.599999999999994 313.6,46.400000000000006" fill="#639922" fill-opacity="0.15" stroke="#639922" stroke-width="1.8" stroke-linejoin="round"></polygon><polygon data-c="v" points="116.4,46.400000000000006 142.2,51.68 177.6,46.400000000000006 182,34.08 161.2,27.039999999999996 131,34.08" fill="#639922" fill-opacity="0.15" stroke="#639922" stroke-width="1.8" stroke-linejoin="round"></polygon><polygon data-c="u" points="190.79999999999998,99.2 236.8,100.96000000000001 265.2,92.16000000000001 262.8,79.84 225.2,76.32 195.2,86.88" fill="#D85A30" fill-opacity="0.15" stroke="#D85A30" stroke-width="1.8" stroke-linejoin="round"></polygon><polygon data-c="u" points="205.2,68.4 236,71.92000000000002 269.79999999999995,68.4 283.8,60.48 255.6,57.84 219.2,60.48" fill="#D85A30" fill-opacity="0.15" stroke="#D85A30" stroke-width="1.8" stroke-linejoin="round"></polygon><polygon data-c="s" points="307.6,90.4 338.4,93.92 378.79999999999995,86.88 383.2,74.56 354,69.28 313.59999999999997,76.32" fill="#BA7517" fill-opacity="0.15" stroke="#BA7517" stroke-width="1.8" stroke-linejoin="round"></polygon><polygon data-c="a" points="66.6,215.44 104.20000000000002,218.96 141.20000000000002,211.92000000000002 145.6,199.6 175.6,189.04000000000002 154.8,182 116,187.28 91.2,199.6" fill="#378ADD" fill-opacity="0.15" stroke="#378ADD" stroke-width="1.8" stroke-linejoin="round"></polygon><polygon data-c="v" points="196.4,166.16 225.6,171.44 269.6,167.92 292.8,157.36 282,146.8 243.6,144.16 205.8,152.08" fill="#639922" fill-opacity="0.15" stroke="#639922" stroke-width="1.8" stroke-linejoin="round"></polygon><polygon data-c="v" points="310.79999999999995,174.96 341.59999999999997,178.48 382,171.44 398.4,160.88 377.6,153.84 342,155.6 313.6,164.4" fill="#639922" fill-opacity="0.15" stroke="#639922" stroke-width="1.8" stroke-linejoin="round"></polygon><polygon data-c="v" points="116.4,164.4 142.2,169.68 177.6,164.4 182,152.08 161.2,145.04 131,152.08" fill="#639922" fill-opacity="0.15" stroke="#639922" stroke-width="1.8" stroke-linejoin="round"></polygon><polygon data-c="u" points="190.79999999999998,217.2 236.8,218.96 265.2,210.16000000000003 262.8,197.84 225.2,194.32 195.2,204.88" fill="#D85A30" fill-opacity="0.15" stroke="#D85A30" stroke-width="1.8" stroke-linejoin="round"></polygon><polygon data-c="u" points="205.2,186.4 236,189.92000000000002 269.79999999999995,186.4 283.8,178.48 255.6,175.84 219.2,178.48" fill="#D85A30" fill-opacity="0.15" stroke="#D85A30" stroke-width="1.8" stroke-linejoin="round"></polygon><polygon data-c="s" points="307.6,208.4 338.4,211.92000000000002 378.79999999999995,204.88 383.2,192.56 354,187.28 313.59999999999997,194.32" fill="#BA7517" fill-opacity="0.15" stroke="#BA7517" stroke-width="1.8" stroke-linejoin="round"></polygon><polygon data-c="a" points="66.6,333.44 104.20000000000002,336.96000000000004 141.20000000000002,329.92 145.6,317.6 175.6,307.04 154.8,300 116,305.28 91.2,317.6" fill="#378ADD" fill-opacity="0.15" stroke="#378ADD" stroke-width="1.8" stroke-linejoin="round"></polygon><polygon data-c="v" points="196.4,284.15999999999997 225.6,289.44 269.6,285.92 292.8,275.36 282,264.8 243.6,262.15999999999997 205.8,270.08" fill="#639922" fill-opacity="0.15" stroke="#639922" stroke-width="1.8" stroke-linejoin="round"></polygon><polygon data-c="v" points="310.79999999999995,292.96 341.59999999999997,296.48 382,289.44 398.4,278.88 377.6,271.84000000000003 342,273.6 313.6,282.4" fill="#639922" fill-opacity="0.15" stroke="#639922" stroke-width="1.8" stroke-linejoin="round"></polygon><polygon data-c="v" points="116.4,282.4 142.2,287.68 177.6,282.4 182,270.08 161.2,263.04 131,270.08" fill="#639922" fill-opacity="0.15" stroke="#639922" stroke-width="1.8" stroke-linejoin="round"></polygon><polygon data-c="u" points="190.79999999999998,335.2 236.8,336.96000000000004 265.2,328.16 262.8,315.84 225.2,312.32 195.2,322.88" fill="#D85A30" fill-opacity="0.15" stroke="#D85A30" stroke-width="1.8" stroke-linejoin="round"></polygon><polygon data-c="u" points="205.2,304.4 236,307.92 269.79999999999995,304.4 283.8,296.48 255.6,293.84000000000003 219.2,296.48" fill="#D85A30" fill-opacity="0.15" stroke="#D85A30" stroke-width="1.8" stroke-linejoin="round"></polygon><polygon data-c="s" points="307.6,326.4 338.4,329.92 378.79999999999995,322.88 383.2,310.56 354,305.28 313.59999999999997,312.32" fill="#BA7517" fill-opacity="0.15" stroke="#BA7517" stroke-width="1.8" stroke-linejoin="round"></polygon><polygon data-c="a" points="66.6,451.44 104.20000000000002,454.96000000000004 141.20000000000002,447.92 145.6,435.6 175.6,425.04 154.8,418 116,423.28 91.2,435.6" fill="#378ADD" fill-opacity="0.15" stroke="#378ADD" stroke-width="1.8" stroke-linejoin="round"></polygon><polygon data-c="v" points="196.4,402.15999999999997 225.6,407.44 269.6,403.92 292.8,393.36 282,382.8 243.6,380.15999999999997 205.8,388.08" fill="#639922" fill-opacity="0.15" stroke="#639922" stroke-width="1.8" stroke-linejoin="round"></polygon><polygon data-c="v" points="310.79999999999995,410.96 341.59999999999997,414.48 382,407.44 398.4,396.88 377.6,389.84000000000003 342,391.6 313.6,400.4" fill="#639922" fill-opacity="0.15" stroke="#639922" stroke-width="1.8" stroke-linejoin="round"></polygon><polygon data-c="v" points="116.4,400.4 142.2,405.68 177.6,400.4 182,388.08 161.2,381.04 131,388.08" fill="#639922" fill-opacity="0.15" stroke="#639922" stroke-width="1.8" stroke-linejoin="round"></polygon><polygon data-c="u" points="190.79999999999998,453.2 236.8,454.96000000000004 265.2,446.16 262.8,433.84 225.2,430.32 195.2,440.88" fill="#D85A30" fill-opacity="0.15" stroke="#D85A30" stroke-width="1.8" stroke-linejoin="round"></polygon><polygon data-c="u" points="205.2,422.4 236,425.92 269.79999999999995,422.4 283.8,414.48 255.6,411.84000000000003 219.2,414.48" fill="#D85A30" fill-opacity="0.15" stroke="#D85A30" stroke-width="1.8" stroke-linejoin="round"></polygon><polygon data-c="s" points="307.6,444.4 338.4,447.92 378.79999999999995,440.88 383.2,428.56 354,423.28 313.59999999999997,430.32" fill="#BA7517" fill-opacity="0.15" stroke="#BA7517" stroke-width="1.8" stroke-linejoin="round"></polygon><polygon data-c="a" points="66.6,569.44 104.20000000000002,572.96 141.20000000000002,565.92 145.6,553.6 175.6,543.04 154.8,536 116,541.28 91.2,553.6" fill="#378ADD" fill-opacity="0.15" stroke="#378ADD" stroke-width="1.8" stroke-linejoin="round"></polygon><polygon data-c="v" points="196.4,520.16 225.6,525.44 269.6,521.92 292.8,511.36 282,500.8 243.6,498.15999999999997 205.8,506.08" fill="#639922" fill-opacity="0.15" stroke="#639922" stroke-width="1.8" stroke-linejoin="round"></polygon><polygon data-c="v" points="310.79999999999995,528.96 341.59999999999997,532.48 382,525.44 398.4,514.88 377.6,507.84000000000003 342,509.6 313.6,518.4" fill="#639922" fill-opacity="0.15" stroke="#639922" stroke-width="1.8" stroke-linejoin="round"></polygon><polygon data-c="v" points="116.4,518.4 142.2,523.68 177.6,518.4 182,506.08 161.2,499.04 131,506.08" fill="#639922" fill-opacity="0.15" stroke="#639922" stroke-width="1.8" stroke-linejoin="round"></polygon><polygon data-c="u" points="190.79999999999998,571.2 236.8,572.96 265.2,564.16 262.8,551.84 225.2,548.32 195.2,558.88" fill="#D85A30" fill-opacity="0.15" stroke="#D85A30" stroke-width="1.8" stroke-linejoin="round"></polygon><polygon data-c="u" points="205.2,540.4 236,543.92 269.79999999999995,540.4 283.8,532.48 255.6,529.84 219.2,532.48" fill="#D85A30" fill-opacity="0.15" stroke="#D85A30" stroke-width="1.8" stroke-linejoin="round"></polygon><polygon data-c="s" points="307.6,562.4 338.4,565.92 378.79999999999995,558.88 383.2,546.56 354,541.28 313.59999999999997,548.32" fill="#BA7517" fill-opacity="0.15" stroke="#BA7517" stroke-width="1.8" stroke-linejoin="round"></polygon><line class="leader" x1="424" y1="64" x2="470" y2="64"></line><text class="th" x="478" y="60">Banda 1 · azul</text><text class="ts" x="478" y="78">0,45–0,52 µm</text><line class="leader" x1="424" y1="182" x2="470" y2="182"></line><text class="th" x="478" y="178">Banda 2 · verde</text><text class="ts" x="478" y="196">0,52–0,60 µm</text><line class="leader" x1="424" y1="300" x2="470" y2="300"></line><text class="th" x="478" y="296">Banda 3 · vermelho</text><text class="ts" x="478" y="314">0,63–0,69 µm</text><line class="leader" x1="424" y1="418" x2="470" y2="418"></line><text class="th" x="478" y="414">Banda 4 · IV próximo</text><text class="ts" x="478" y="432">0,76–0,90 µm</text><line class="leader" x1="424" y1="536" x2="470" y2="536"></line><text class="th" x="478" y="532">Banda 5 · IV médio</text><text class="ts" x="478" y="550">1,55–1,75 µm</text><text class="ts" x="40" y="609">Reflectância</text><rect x="130" y="598" width="24" height="16" fill="rgb(14,14,14)" stroke="var(--border)" stroke-width="0.5"></rect><rect x="154" y="598" width="24" height="16" fill="rgb(43,43,43)" stroke="var(--border)" stroke-width="0.5"></rect><rect x="178" y="598" width="24" height="16" fill="rgb(71,71,71)" stroke="var(--border)" stroke-width="0.5"></rect><rect x="202" y="598" width="24" height="16" fill="rgb(99,99,99)" stroke="var(--border)" stroke-width="0.5"></rect><rect x="226" y="598" width="24" height="16" fill="rgb(128,128,128)" stroke="var(--border)" stroke-width="0.5"></rect><rect x="250" y="598" width="24" height="16" fill="rgb(156,156,156)" stroke="var(--border)" stroke-width="0.5"></rect><rect x="274" y="598" width="24" height="16" fill="rgb(184,184,184)" stroke="var(--border)" stroke-width="0.5"></rect><rect x="298" y="598" width="24" height="16" fill="rgb(213,213,213)" stroke="var(--border)" stroke-width="0.5"></rect><rect x="322" y="598" width="24" height="16" fill="rgb(241,241,241)" stroke="var(--border)" stroke-width="0.5"></rect><rect x="346" y="598" width="24" height="16" fill="rgb(255,255,255)" stroke="var(--border)" stroke-width="0.5"></rect><text class="ts" x="130" y="634">0 %</text><text class="ts" x="370" y="634" text-anchor="end">45 % ou mais</text><g id="mk"><polygon points="226,90.4 231.3125,90.4 233.8125,87.65 228.5,87.65" fill="none" stroke="#000" stroke-width="3.2" stroke-linejoin="round"></polygon><polygon points="226,90.4 231.3125,90.4 233.8125,87.65 228.5,87.65" fill="none" stroke="#fff" stroke-width="1.3" stroke-linejoin="round"></polygon><polygon points="226,208.4 231.3125,208.4 233.8125,205.65 228.5,205.65" fill="none" stroke="#000" stroke-width="3.2" stroke-linejoin="round"></polygon><polygon points="226,208.4 231.3125,208.4 233.8125,205.65 228.5,205.65" fill="none" stroke="#fff" stroke-width="1.3" stroke-linejoin="round"></polygon><polygon points="226,326.4 231.3125,326.4 233.8125,323.65 228.5,323.65" fill="none" stroke="#000" stroke-width="3.2" stroke-linejoin="round"></polygon><polygon points="226,326.4 231.3125,326.4 233.8125,323.65 228.5,323.65" fill="none" stroke="#fff" stroke-width="1.3" stroke-linejoin="round"></polygon><polygon points="226,444.4 231.3125,444.4 233.8125,441.65 228.5,441.65" fill="none" stroke="#000" stroke-width="3.2" stroke-linejoin="round"></polygon><polygon points="226,444.4 231.3125,444.4 233.8125,441.65 228.5,441.65" fill="none" stroke="#fff" stroke-width="1.3" stroke-linejoin="round"></polygon><polygon points="226,562.4 231.3125,562.4 233.8125,559.65 228.5,559.65" fill="none" stroke="#000" stroke-width="3.2" stroke-linejoin="round"></polygon><polygon points="226,562.4 231.3125,562.4 233.8125,559.65 228.5,559.65" fill="none" stroke="#fff" stroke-width="1.3" stroke-linejoin="round"></polygon></g></svg>
+</div>
+<div class="cap">Janela ampliada: níveis de cinza (0–255) de cada pixel nas cinco bandas, nas mesmas posições</div>
+<div id="zoom"><div><div class="zl">B1 · azul</div><div class="zg"><div class="zc" style="background:rgb(55,55,55);color:#F1EFE8">55</div><div class="zc" style="background:rgb(59,59,59);color:#F1EFE8">59</div><div class="zc" style="background:rgb(81,81,81);color:#F1EFE8">81</div><div class="zc" style="background:rgb(58,58,58);color:#F1EFE8">58</div><div class="zc" style="background:rgb(66,66,66);color:#F1EFE8">66</div><div class="zc" style="background:rgb(66,66,66);color:#F1EFE8">66</div><div class="zc" style="background:rgb(68,68,68);color:#F1EFE8">68</div><div class="zc" style="background:rgb(69,69,69);color:#F1EFE8">69</div><div class="zc" style="background:rgb(75,75,75);color:#F1EFE8">75</div><div class="zc" style="background:rgb(79,79,79);color:#F1EFE8">79</div><div class="zc" style="background:rgb(67,67,67);color:#F1EFE8">67</div><div class="zc" style="background:rgb(76,76,76);color:#F1EFE8">76</div><div class="zc" style="background:rgb(64,64,64);color:#F1EFE8">64</div><div class="zc" style="background:rgb(58,58,58);color:#F1EFE8">58</div><div class="zc" style="background:rgb(70,70,70);color:#F1EFE8">70</div><div class="zc" style="background:rgb(61,61,61);color:#F1EFE8">61</div><div class="zc" style="background:rgb(79,79,79);color:#F1EFE8">79</div><div class="zc" style="background:rgb(74,74,74);color:#F1EFE8">74</div><div class="zc" style="background:rgb(60,60,60);color:#F1EFE8">60</div><div class="zc" style="background:rgb(68,68,68);color:#F1EFE8">68</div><div class="zc" style="background:rgb(75,75,75);color:#F1EFE8">75</div><div class="zc" style="background:rgb(65,65,65);color:#F1EFE8">65</div><div class="zc" style="background:rgb(69,69,69);color:#F1EFE8">69</div><div class="zc" style="background:rgb(65,65,65);color:#F1EFE8">65</div><div class="zc" style="background:rgb(72,72,72);color:#F1EFE8">72</div></div></div><div><div class="zl">B2 · verde</div><div class="zg"><div class="zc" style="background:rgb(64,64,64);color:#F1EFE8">64</div><div class="zc" style="background:rgb(67,67,67);color:#F1EFE8">67</div><div class="zc" style="background:rgb(92,92,92);color:#F1EFE8">92</div><div class="zc" style="background:rgb(65,65,65);color:#F1EFE8">65</div><div class="zc" style="background:rgb(77,77,77);color:#F1EFE8">77</div><div class="zc" style="background:rgb(77,77,77);color:#F1EFE8">77</div><div class="zc" style="background:rgb(81,81,81);color:#F1EFE8">81</div><div class="zc" style="background:rgb(82,82,82);color:#F1EFE8">82</div><div class="zc" style="background:rgb(84,84,84);color:#F1EFE8">84</div><div class="zc" style="background:rgb(88,88,88);color:#F1EFE8">88</div><div class="zc" style="background:rgb(76,76,76);color:#F1EFE8">76</div><div class="zc" style="background:rgb(91,91,91);color:#F1EFE8">91</div><div class="zc" style="background:rgb(72,72,72);color:#F1EFE8">72</div><div class="zc" style="background:rgb(65,65,65);color:#F1EFE8">65</div><div class="zc" style="background:rgb(84,84,84);color:#F1EFE8">84</div><div class="zc" style="background:rgb(71,71,71);color:#F1EFE8">71</div><div class="zc" style="background:rgb(88,88,88);color:#F1EFE8">88</div><div class="zc" style="background:rgb(81,81,81);color:#F1EFE8">81</div><div class="zc" style="background:rgb(70,70,70);color:#F1EFE8">70</div><div class="zc" style="background:rgb(76,76,76);color:#F1EFE8">76</div><div class="zc" style="background:rgb(83,83,83);color:#F1EFE8">83</div><div class="zc" style="background:rgb(76,76,76);color:#F1EFE8">76</div><div class="zc" style="background:rgb(82,82,82);color:#F1EFE8">82</div><div class="zc" style="background:rgb(77,77,77);color:#F1EFE8">77</div><div class="zc" style="background:rgb(82,82,82);color:#F1EFE8">82</div></div></div><div><div class="zl">B3 · vermelho</div><div class="zg"><div class="zc" style="background:rgb(74,74,74);color:#F1EFE8">74</div><div class="zc" style="background:rgb(75,75,75);color:#F1EFE8">75</div><div class="zc" style="background:rgb(104,104,104);color:#F1EFE8">104</div><div class="zc" style="background:rgb(76,76,76);color:#F1EFE8">76</div><div class="zc" style="background:rgb(83,83,83);color:#F1EFE8">83</div><div class="zc" style="background:rgb(86,86,86);color:#F1EFE8">86</div><div class="zc" style="background:rgb(93,93,93);color:#F1EFE8">93</div><div class="zc" style="background:rgb(93,93,93);color:#F1EFE8">93</div><div class="zc" style="background:rgb(101,101,101);color:#F1EFE8">101</div><div class="zc" style="background:rgb(100,100,100);color:#F1EFE8">100</div><div class="zc" style="background:rgb(85,85,85);color:#F1EFE8">85</div><div class="zc" style="background:rgb(99,99,99);color:#F1EFE8">99</div><div class="zc" style="background:rgb(84,84,84);color:#F1EFE8">84</div><div class="zc" style="background:rgb(77,77,77);color:#F1EFE8">77</div><div class="zc" style="background:rgb(95,95,95);color:#F1EFE8">95</div><div class="zc" style="background:rgb(80,80,80);color:#F1EFE8">80</div><div class="zc" style="background:rgb(100,100,100);color:#F1EFE8">100</div><div class="zc" style="background:rgb(97,97,97);color:#F1EFE8">97</div><div class="zc" style="background:rgb(79,79,79);color:#F1EFE8">79</div><div class="zc" style="background:rgb(90,90,90);color:#F1EFE8">90</div><div class="zc" style="background:rgb(97,97,97);color:#F1EFE8">97</div><div class="zc" style="background:rgb(86,86,86);color:#F1EFE8">86</div><div class="zc" style="background:rgb(91,91,91);color:#F1EFE8">91</div><div class="zc" style="background:rgb(89,89,89);color:#F1EFE8">89</div><div class="zc" style="background:rgb(95,95,95);color:#F1EFE8">95</div></div></div><div><div class="zl">B4 · IV próximo</div><div class="zg"><div class="zc" style="background:rgb(83,83,83);color:#F1EFE8">83</div><div class="zc" style="background:rgb(87,87,87);color:#F1EFE8">87</div><div class="zc" style="background:rgb(114,114,114);color:#F1EFE8">114</div><div class="zc" style="background:rgb(84,84,84);color:#F1EFE8">84</div><div class="zc" style="background:rgb(95,95,95);color:#F1EFE8">95</div><div class="zc" style="background:rgb(94,94,94);color:#F1EFE8">94</div><div class="zc" style="background:rgb(101,101,101);color:#F1EFE8">101</div><div class="zc" style="background:rgb(102,102,102);color:#F1EFE8">102</div><div class="zc" style="background:rgb(109,109,109);color:#F1EFE8">109</div><div class="zc" style="background:rgb(115,115,115);color:#F1EFE8">115</div><div class="zc" style="background:rgb(97,97,97);color:#F1EFE8">97</div><div class="zc" style="background:rgb(111,111,111);color:#F1EFE8">111</div><div class="zc" style="background:rgb(93,93,93);color:#F1EFE8">93</div><div class="zc" style="background:rgb(85,85,85);color:#F1EFE8">85</div><div class="zc" style="background:rgb(106,106,106);color:#F1EFE8">106</div><div class="zc" style="background:rgb(92,92,92);color:#F1EFE8">92</div><div class="zc" style="background:rgb(111,111,111);color:#F1EFE8">111</div><div class="zc" style="background:rgb(106,106,106);color:#F1EFE8">106</div><div class="zc" style="background:rgb(89,89,89);color:#F1EFE8">89</div><div class="zc" style="background:rgb(100,100,100);color:#F1EFE8">100</div><div class="zc" style="background:rgb(104,104,104);color:#F1EFE8">104</div><div class="zc" style="background:rgb(97,97,97);color:#F1EFE8">97</div><div class="zc" style="background:rgb(101,101,101);color:#F1EFE8">101</div><div class="zc" style="background:rgb(97,97,97);color:#F1EFE8">97</div><div class="zc" style="background:rgb(103,103,103);color:#F1EFE8">103</div></div></div><div><div class="zl">B5 · IV médio</div><div class="zg"><div class="zc" style="background:rgb(94,94,94);color:#F1EFE8">94</div><div class="zc" style="background:rgb(100,100,100);color:#F1EFE8">100</div><div class="zc" style="background:rgb(134,134,134);color:#F1EFE8">134</div><div class="zc" style="background:rgb(97,97,97);color:#F1EFE8">97</div><div class="zc" style="background:rgb(109,109,109);color:#F1EFE8">109</div><div class="zc" style="background:rgb(112,112,112);color:#F1EFE8">112</div><div class="zc" style="background:rgb(120,120,120);color:#F1EFE8">120</div><div class="zc" style="background:rgb(121,121,121);color:#F1EFE8">121</div><div class="zc" style="background:rgb(131,131,131);color:#F1EFE8">131</div><div class="zc" style="background:rgb(130,130,130);color:#F1EFE8">130</div><div class="zc" style="background:rgb(110,110,110);color:#F1EFE8">110</div><div class="zc" style="background:rgb(132,132,132);color:#F1EFE8">132</div><div class="zc" style="background:rgb(109,109,109);color:#F1EFE8">109</div><div class="zc" style="background:rgb(97,97,97);color:#F1EFE8">97</div><div class="zc" style="background:rgb(122,122,122);color:#F1EFE8">122</div><div class="zc" style="background:rgb(106,106,106);color:#F1EFE8">106</div><div class="zc" style="background:rgb(128,128,128);color:#F1EFE8">128</div><div class="zc" style="background:rgb(126,126,126);color:#F1EFE8">126</div><div class="zc" style="background:rgb(106,106,106);color:#F1EFE8">106</div><div class="zc" style="background:rgb(113,113,113);color:#F1EFE8">113</div><div class="zc" style="background:rgb(124,124,124);color:#F1EFE8">124</div><div class="zc" style="background:rgb(113,113,113);color:#F1EFE8">113</div><div class="zc" style="background:rgb(120,120,120);color:#F1EFE8">120</div><div class="zc" style="background:rgb(110,110,110);color:#F1EFE8">110</div><div class="zc" style="background:rgb(122,122,122);color:#F1EFE8">122</div></div></div></div>
+<div class="cap" id="winfo">Janela de 5 × 5 pixels (colunas 161–165 e linhas 124–128 da grade 320 × 160). Classe(s) na janela: Área urbana: 25 de 25 pixels.</div>
+<div class="cap">Assinatura espectral das amostras: cada linha fina é uma amostra e a linha grossa é a média da classe</div>
+<svg id="sig" width="100%" viewBox="0 0 680 275" role="img"><title>Assinaturas espectrais das classes</title><desc>Reflectância média e de cada amostra nas cinco bandas para água, vegetação, área urbana e solo exposto.</desc><line x1="70" y1="230" x2="640" y2="230" stroke="var(--border)" stroke-width="0.5"></line><text class="ts" x="62" y="230" text-anchor="end" dominant-baseline="central">0</text><line x1="70" y1="190" x2="640" y2="190" stroke="var(--border)" stroke-width="0.5"></line><text class="ts" x="62" y="190" text-anchor="end" dominant-baseline="central">10</text><line x1="70" y1="150" x2="640" y2="150" stroke="var(--border)" stroke-width="0.5"></line><text class="ts" x="62" y="150" text-anchor="end" dominant-baseline="central">20</text><line x1="70" y1="110" x2="640" y2="110" stroke="var(--border)" stroke-width="0.5"></line><text class="ts" x="62" y="110" text-anchor="end" dominant-baseline="central">30</text><line x1="70" y1="70" x2="640" y2="70" stroke="var(--border)" stroke-width="0.5"></line><text class="ts" x="62" y="70" text-anchor="end" dominant-baseline="central">40</text><line x1="70" y1="30" x2="640" y2="30" stroke="var(--border)" stroke-width="0.5"></line><text class="ts" x="62" y="30" text-anchor="end" dominant-baseline="central">50</text><text class="ts" x="70" y="14">Reflectância (%)</text><text class="ts" x="110" y="254" text-anchor="middle">B1 · azul</text><text class="ts" x="215" y="254" text-anchor="middle">B2 · verde</text><text class="ts" x="320" y="254" text-anchor="middle">B3 · vermelho</text><text class="ts" x="430" y="254" text-anchor="middle">B4 · IV próximo</text><text class="ts" x="540" y="254" text-anchor="middle">B5 · IV médio</text><polyline data-c="a" fill="none" stroke="#378ADD" stroke-width="1" opacity="0.5" points="110,206 215,210 320,218 430,224 540,226.8"></polyline><g data-c="a"><polyline fill="none" stroke="#378ADD" stroke-width="2.5" points="110,206 215,210 320,218 430,224 540,226.8"></polyline><circle cx="110" cy="206" r="4" fill="#378ADD" stroke="#185FA5" stroke-width="1"></circle><circle cx="215" cy="210" r="4" fill="#378ADD" stroke="#185FA5" stroke-width="1"></circle><circle cx="320" cy="218" r="4" fill="#378ADD" stroke="#185FA5" stroke-width="1"></circle><circle cx="430" cy="224" r="4" fill="#378ADD" stroke="#185FA5" stroke-width="1"></circle><circle cx="540" cy="226.8" r="4" fill="#378ADD" stroke="#185FA5" stroke-width="1"></circle><text class="ts" x="556" y="226.8" dominant-baseline="central">Água</text></g><polyline data-c="v" fill="none" stroke="#639922" stroke-width="1" opacity="0.5" points="110,217.6 215,209.6 320,216.2 430,82 540,163.2"></polyline><polyline data-c="v" fill="none" stroke="#639922" stroke-width="1" opacity="0.5" points="110,218 215,206 320,216 430,70 540,158"></polyline><polyline data-c="v" fill="none" stroke="#639922" stroke-width="1" opacity="0.5" points="110,218.4 215,202 320,215.8 430,58 540,152.8"></polyline><g data-c="v"><polyline fill="none" stroke="#639922" stroke-width="2.5" points="110,218 215,205.86666666666667 320,216 430,70 540,158"></polyline><circle cx="110" cy="218" r="4" fill="#639922" stroke="#3B6D11" stroke-width="1"></circle><circle cx="215" cy="205.86666666666667" r="4" fill="#639922" stroke="#3B6D11" stroke-width="1"></circle><circle cx="320" cy="216" r="4" fill="#639922" stroke="#3B6D11" stroke-width="1"></circle><circle cx="430" cy="70" r="4" fill="#639922" stroke="#3B6D11" stroke-width="1"></circle><circle cx="540" cy="158" r="4" fill="#639922" stroke="#3B6D11" stroke-width="1"></circle><text class="ts" x="556" y="158" dominant-baseline="central">Vegetação</text></g><polyline data-c="u" fill="none" stroke="#D85A30" stroke-width="1" opacity="0.5" points="110,180.16 215,176.4 320,165.84 430,158.88 540,147.04"></polyline><polyline data-c="u" fill="none" stroke="#D85A30" stroke-width="1" opacity="0.5" points="110,175.84 215,163.6 320,158.16 430,149.12 540,136.95999999999998"></polyline><g data-c="u"><polyline fill="none" stroke="#D85A30" stroke-width="2.5" points="110,178 215,170 320,162 430,154 540,142"></polyline><circle cx="110" cy="178" r="4" fill="#D85A30" stroke="#993C1D" stroke-width="1"></circle><circle cx="215" cy="170" r="4" fill="#D85A30" stroke="#993C1D" stroke-width="1"></circle><circle cx="320" cy="162" r="4" fill="#D85A30" stroke="#993C1D" stroke-width="1"></circle><circle cx="430" cy="154" r="4" fill="#D85A30" stroke="#993C1D" stroke-width="1"></circle><circle cx="540" cy="142" r="4" fill="#D85A30" stroke="#993C1D" stroke-width="1"></circle><text class="ts" x="556" y="142" dominant-baseline="central">Área urbana</text></g><polyline data-c="s" fill="none" stroke="#BA7517" stroke-width="1" opacity="0.5" points="110,190 215,170 320,142 430,110 540,86"></polyline><g data-c="s"><polyline fill="none" stroke="#BA7517" stroke-width="2.5" points="110,190 215,170 320,142 430,110 540,86"></polyline><circle cx="110" cy="190" r="4" fill="#BA7517" stroke="#854F0B" stroke-width="1"></circle><circle cx="215" cy="170" r="4" fill="#BA7517" stroke="#854F0B" stroke-width="1"></circle><circle cx="320" cy="142" r="4" fill="#BA7517" stroke="#854F0B" stroke-width="1"></circle><circle cx="430" cy="110" r="4" fill="#BA7517" stroke="#854F0B" stroke-width="1"></circle><circle cx="540" cy="86" r="4" fill="#BA7517" stroke="#854F0B" stroke-width="1"></circle><text class="ts" x="556" y="86" dominant-baseline="central">Solo exposto</text></g></svg>
+</main>
+<script>
+const C={a:{n:'Água',f:'#378ADD',s:'#185FA5'},v:{n:'Vegetação',f:'#639922',s:'#3B6D11'},u:{n:'Área urbana',f:'#D85A30',s:'#993C1D'},s:{n:'Solo exposto',f:'#BA7517',s:'#854F0B'}};
+const R=[
+['a',1,[[.05,.12],[.17,.08],[.26,.16],[.24,.30],[.30,.42],[.22,.50],[.12,.44],[.08,.30]]],
+['v',.9,[[.30,.68],[.40,.62],[.52,.66],[.56,.78],[.50,.90],[.38,.93],[.29,.84]]],
+['v',1,[[.66,.58],[.76,.54],[.86,.62],[.88,.74],[.80,.82],[.70,.80],[.64,.70]]],
+['v',1.1,[[.06,.70],[.15,.64],[.24,.70],[.22,.84],[.14,.92],[.07,.84]]],
+['u',.92,[[.42,.10],[.56,.08],[.62,.18],[.58,.32],[.46,.36],[.40,.24]]],
+['u',1.08,[[.38,.45],[.48,.41],[.57,.45],[.59,.54],[.50,.57],[.40,.54]]],
+['s',1,[[.74,.20],[.84,.16],[.94,.24],[.92,.38],[.82,.44],[.72,.36]]]
+];
+const V={a:[6,5,3,1.5,0.8],v:[3,6,3.5,40,18],u:[13,15,17,19,22],s:[10,15,22,30,36]};
+const AMP={a:.10,v:.16,u:.35,s:.18};
+const B=[['Banda 1 · azul','0,45–0,52 µm'],['Banda 2 · verde','0,52–0,60 µm'],['Banda 3 · vermelho','0,63–0,69 µm'],['Banda 4 · IV próximo','0,76–0,90 µm'],['Banda 5 · IV médio','1,55–1,75 µm']];
+const W=340,S=80,H=88,X0=40,Y0=20,G=118,SC=2,WN=5;
+const P=(u,v,k)=>[X0+W*u+S*v,Y0+k*G+H*(1-v)];
+const rnd=(i,j,b)=>{const x=Math.sin(i*127.1+j*311.7+b*74.7)*43758.5453;return x-Math.floor(x);};
+const pip=(x,y,p)=>{let c=false;for(let i=0,j=p.length-1;i<p.length;j=i++){const xi=p[i][0],yi=p[i][1],xj=p[j][0],yj=p[j][1];if(((yi>y)!=(yj>y))&&(x<(xj-xi)*(y-yi)/(yj-yi)+xi))c=!c;}return c;};
+const seeds=R.map(r=>({c:r[0],f:r[1],u:r[2].reduce((t,p)=>t+p[0],0)/r[2].length,v:r[2].reduce((t,p)=>t+p[1],0)/r[2].length}));
+let NX=320,NY=160,cls,val,cur='',wu=seeds[4].u,wv=seeds[4].v,wi=0,wr=0,curIdx=4;
+function build(nx,ny){
+ NX=nx;NY=ny;cls=new Uint8Array(nx*ny);val=[0,1,2,3,4].map(()=>new Uint8Array(nx*ny));
+ for(let r=0;r<ny;r++){const v=1-(r+.5)/ny;
+  for(let i=0;i<nx;i++){const u=(i+.5)/nx;let q=-1;
+   for(let m=0;m<R.length;m++){if(pip(u,v,R[m][2])){q=m;break;}}
+   if(q<0){const a=u+0.05*Math.sin(9*v+3*u),b=v+0.06*Math.sin(7*u+2*v);let best=1e9;
+    seeds.forEach((sd,m)=>{const d=(a-sd.u)**2+((b-sd.v)*0.8)**2;if(d<best){best=d;q=m;}});}
+   const p=r*nx+i,sd=seeds[q],c=sd.c;cls[p]=q;
+   for(let b=0;b<5;b++){const x=V[c][b]*sd.f*(1+AMP[c]*(rnd(i,r,9)-.5))*(1+.06*(rnd(i,r,b)-.5));
+    val[b][p]=Math.round(255*Math.min(1,Math.max(0,x/45)));}
+  }}
+}
+const cv=document.getElementById('cv'),ctx=cv.getContext('2d'),off=document.createElement('canvas');
+function render(){
+ off.width=NX;off.height=NY;const oc=off.getContext('2d');
+ ctx.setTransform(1,0,0,1,0,0);ctx.clearRect(0,0,cv.width,cv.height);
+ ctx.imageSmoothingEnabled=NX>100;
+ for(let k=0;k<5;k++){
+  const img=oc.createImageData(NX,NY),d=img.data;
+  for(let p=0;p<NX*NY;p++){const g=val[k][p],a=(!cur||seeds[cls[p]].c===cur)?255:31;d[4*p]=g;d[4*p+1]=g;d[4*p+2]=g;d[4*p+3]=a;}
+  oc.putImageData(img,0,0);
+  ctx.setTransform(W/NX*SC,0,-S/NY*SC,H/NY*SC,(X0+S)*SC,(Y0+k*G)*SC);
+  ctx.drawImage(off,0,0);
+ }
+ ctx.setTransform(1,0,0,1,0,0);
+}
+let s='';
+for(let k=0;k<5;k++){const ol=[P(0,0,k),P(1,0,k),P(1,1,k),P(0,1,k)].map(p=>p.join(',')).join(' ');s+=`<polygon points="${ol}" fill="none" stroke="var(--border-strong)" stroke-width="0.8"/>`;}
+seeds.forEach(sd=>{const a=P(sd.u,sd.v,0),b=P(sd.u,sd.v,4);s+=`<line data-c="${sd.c}" x1="${a[0]}" y1="${a[1]}" x2="${b[0]}" y2="${b[1]}" stroke="${C[sd.c].f}" stroke-width="1.2" stroke-dasharray="3 3"/>`;});
+for(let k=0;k<5;k++){R.forEach(r=>{const pts=r[2].map(p=>P(p[0],p[1],k).join(',')).join(' ');s+=`<polygon data-c="${r[0]}" points="${pts}" fill="${C[r[0]].f}" fill-opacity="0.15" stroke="${C[r[0]].f}" stroke-width="1.8" stroke-linejoin="round"/>`;});}
+for(let k=0;k<5;k++){const e=P(1,.5,k),my=Y0+k*G+H/2;s+=`<line class="leader" x1="${e[0]+4}" y1="${e[1]}" x2="470" y2="${e[1]}"/><text class="th" x="478" y="${my-4}">${B[k][0]}</text><text class="ts" x="478" y="${my+14}">${B[k][1]}</text>`;}
+s+='<text class="ts" x="40" y="609">Reflectância</text>';
+for(let i=0;i<10;i++){const g=Math.min(255,Math.round(255*(i*5+2.5)/45));s+=`<rect x="${130+i*24}" y="598" width="24" height="16" fill="rgb(${g},${g},${g})" stroke="var(--border)" stroke-width="0.5"/>`;}
+s+='<text class="ts" x="130" y="634">0 %</text><text class="ts" x="370" y="634" text-anchor="end">45 % ou mais</text><g id="mk"></g>';
+document.getElementById('ov').innerHTML+=s;
+const F={a:[1],v:[0.9,1,1.1],u:[0.92,1.08],s:[1]};
+const N={a:[[0,0,0,0,0]],v:[[.4,-.3,.3,1,.5],[0,0,0,0,0],[-.4,.4,-.3,-1,-.5]],u:[[.5,-.4,.4,.3,.5],[-.5,.4,-.4,-.3,-.5]],s:[[0,0,0,0,0]]};
+const X=[110,215,320,430,540],Y=v=>230-v*4;
+let g='';
+[0,10,20,30,40,50].forEach(t=>{g+=`<line x1="70" y1="${Y(t)}" x2="640" y2="${Y(t)}" stroke="var(--border)" stroke-width="0.5"/><text class="ts" x="62" y="${Y(t)}" text-anchor="end" dominant-baseline="central">${t}</text>`;});
+g+='<text class="ts" x="70" y="14">Reflectância (%)</text>';
+['B1 · azul','B2 · verde','B3 · vermelho','B4 · IV próximo','B5 · IV médio'].forEach((t,i)=>{g+=`<text class="ts" x="${X[i]}" y="254" text-anchor="middle">${t}</text>`;});
+Object.keys(V).forEach(c=>{
+ const sm=F[c].map((f,k)=>V[c].map((v,i)=>Math.max(0.5,v*f+N[c][k][i])));
+ const mean=[0,1,2,3,4].map(i=>sm.reduce((t,a)=>t+a[i],0)/sm.length);
+ sm.forEach(a=>{g+=`<polyline data-c="${c}" fill="none" stroke="${C[c].f}" stroke-width="1" opacity="0.5" points="${a.map((v,i)=>X[i]+','+Y(v)).join(' ')}"/>`;});
+ g+=`<g data-c="${c}"><polyline fill="none" stroke="${C[c].f}" stroke-width="2.5" points="${mean.map((v,i)=>X[i]+','+Y(v)).join(' ')}"/>`;
+ mean.forEach((v,i)=>{g+=`<circle cx="${X[i]}" cy="${Y(v)}" r="4" fill="${C[c].f}" stroke="${C[c].s}" stroke-width="1"/>`;});
+ g+=`<text class="ts" x="556" y="${Y(mean[4])}" dominant-baseline="central">${C[c].n}</text></g>`;
+});
+document.getElementById('sig').innerHTML+=g;
+function placeWin(){
+ wi=Math.min(NX-WN,Math.max(0,Math.round(wu*NX-WN/2)));
+ wr=Math.min(NY-WN,Math.max(0,Math.round((1-wv)*NY-WN/2)));
+}
+function drawMarker(){
+ const u0=wi/NX,u1=(wi+WN)/NX,vt=1-wr/NY,vb=1-(wr+WN)/NY;let m='';
+ for(let k=0;k<5;k++){const pts=[P(u0,vb,k),P(u1,vb,k),P(u1,vt,k),P(u0,vt,k)].map(p=>p.join(',')).join(' ');
+  m+=`<polygon points="${pts}" fill="none" stroke="#000" stroke-width="3.2" stroke-linejoin="round"/><polygon points="${pts}" fill="none" stroke="#fff" stroke-width="1.3" stroke-linejoin="round"/>`;}
+ document.getElementById('mk').innerHTML=m;
+}
+function drawZoom(){
+ const labs=['B1 · azul','B2 · verde','B3 · vermelho','B4 · IV próximo','B5 · IV médio'];let h='';
+ for(let b=0;b<5;b++){
+  h+=`<div><div class="zl">${labs[b]}</div><div class="zg">`;
+  for(let r=0;r<WN;r++)for(let i=0;i<WN;i++){const gv=val[b][(wr+r)*NX+wi+i];
+   h+=`<div class="zc" style="background:rgb(${gv},${gv},${gv});color:${gv>140?'#2C2C2A':'#F1EFE8'}">${gv}</div>`;}
+  h+='</div></div>';
+ }
+ document.getElementById('zoom').innerHTML=h;
+ const cnt={};for(let r=0;r<WN;r++)for(let i=0;i<WN;i++){const c=seeds[cls[(wr+r)*NX+wi+i]].c;cnt[c]=(cnt[c]||0)+1;}
+ const comp=Object.keys(cnt).map(c=>`${C[c].n}: ${cnt[c]} de ${WN*WN} pixels`).join(' · ');
+ document.getElementById('winfo').textContent=`Janela de ${WN} × ${WN} pixels (colunas ${wi+1}–${wi+WN} e linhas ${wr+1}–${wr+WN} da grade ${NX} × ${NY}). Classe(s) na janela: ${comp}.`;
+}
+function refreshWin(idx){
+ placeWin();drawMarker();drawZoom();
+ for(let k=0;k<7;k++)document.getElementById('w'+k).setAttribute('aria-pressed',String(k===idx));
+}
+function goSample(i){curIdx=i;wu=seeds[i].u;wv=seeds[i].v;refreshWin(i);}
+document.getElementById('ov').addEventListener('click',e=>{
+ const ov=e.currentTarget,rc=ov.getBoundingClientRect(),x=(e.clientX-rc.left)*680/rc.width,y=(e.clientY-rc.top)*640/rc.height;
+ for(let k=0;k<5;k++){const v=1-(y-Y0-k*G)/H;if(v<0||v>1)continue;const u=(x-X0-S*v)/W;if(u<0||u>1)continue;curIdx=-1;wu=u;wv=v;refreshWin(-1);return;}
+});
+function sel(c){
+ cur=c;render();
+ document.querySelectorAll('[data-c]').forEach(e=>{e.style.opacity=(!c||e.dataset.c===c)?'':'0.12';});
+ ['all','a','v','u','s'].forEach(k=>{document.getElementById('b-'+k).setAttribute('aria-pressed',String((k==='all'&&!c)||k===c));});
+}
+function setRes(fine){
+ if(fine)build(320,160);else build(32,16);
+ render();refreshWin(curIdx);
+ document.getElementById('r-fine').setAttribute('aria-pressed',String(fine));
+ document.getElementById('r-coarse').setAttribute('aria-pressed',String(!fine));
+}
+build(320,160);render();refreshWin(4);
+</script>
+
+
+</body></html>
